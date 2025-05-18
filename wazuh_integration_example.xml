@@ -1,0 +1,121 @@
+<!-- 
+Contoh Konfigurasi Wazuh untuk Integrasi dengan Sistem Anti-Defacement
+Simpan sebagai: /var/ossec/etc/rules/web_defacement_rules.xml
+-->
+
+<!-- 1. Custom Rules untuk Deteksi Web Defacement -->
+<group name="web,defacement,">
+  <!-- Rule dasar untuk perubahan file di direktori web -->
+  <rule id="100500" level="10">
+    <if_group>syscheck</if_group>
+    <match>^/var/www/html</match>
+    <regex>modified|added</regex>
+    <description>Perubahan terdeteksi pada file web</description>
+  </rule>
+  
+  <!-- Rule untuk penambahan file mencurigakan di direktori web -->
+  <rule id="100501" level="12" frequency="3" timeframe="300">
+    <if_sid>100500</if_sid>
+    <regex>\.php$|\.html$|\.js$|\.htaccess$</regex>
+    <description>Kemungkinan defacement: Beberapa file web penting dimodifikasi</description>
+  </rule>
+  
+  <!-- Rule untuk perubahan pada file indeks utama -->
+  <rule id="100502" level="14">
+    <if_sid>100500</if_sid>
+    <match>index.php|index.html</match>
+    <description>Halaman utama website dimodifikasi - Kemungkinan defacement!</description>
+  </rule>
+  
+  <!-- Rule untuk penambahan file eksekusi skrip berbahaya -->
+  <rule id="100503" level="14">
+    <if_sid>100500</if_sid>
+    <regex>\.php$|\.cgi$|\.pl$</regex>
+    <match>added</match>
+    <description>File skrip baru ditambahkan ke direktori web - Kemungkinan backdoor!</description>
+  </rule>
+</group>
+
+<!-- 
+Contoh Konfigurasi Active Response untuk Wazuh Manager
+Tambahkan ke: /var/ossec/etc/ossec.conf 
+-->
+
+<!--
+<command>
+  <name>web-restore</name>
+  <executable>web-restore</executable>
+  <expect>alert</expect>
+  <extra_args>--auto --alert</extra_args>
+  <timeout_allowed>no</timeout_allowed>
+</command>
+
+<active-response>
+  <command>web-restore</command>
+  <location>local</location>
+  <rules_id>100501,100502</rules_id>
+  <timeout>60</timeout>
+</active-response>
+-->
+
+<!-- 
+Contoh Pengaturan Monitoring File untuk syscheck di Wazuh Agent
+Tambahkan ke: /var/ossec/etc/ossec.conf pada agent server web
+-->
+
+<!--
+<syscheck>
+  <directories check_all="yes" realtime="yes" report_changes="yes">/var/www/html</directories>
+  <ignore>/var/www/html/logs</ignore>
+  <ignore>/var/www/html/cache</ignore>
+  <ignore>/var/www/html/tmp</ignore>
+  <ignore type="sregex">\.log$|\.tmp$</ignore>
+  
+  <!-- Scan setiap 12 jam -->
+  <frequency>43200</frequency>
+  
+  <!-- Tidak melakukan scan saat startup -->
+  <scan_on_start>yes</scan_on_start>
+  
+  <!-- Direktori lain yang perlu dipantau -->
+  <directories check_all="yes" realtime="yes">/etc/apache2/sites-enabled</directories>
+  <directories check_all="yes" realtime="yes">/etc/apache2/conf-enabled</directories>
+</syscheck>
+-->
+
+<!-- 
+Contoh JSON alert dari Wazuh yang bisa dikirim ke script restore.py:
+
+{
+  "timestamp": "2023-12-01T10:15:22.123+0100",
+  "rule": {
+    "level": 14,
+    "description": "Halaman utama website dimodifikasi - Kemungkinan defacement!",
+    "id": "100502",
+    "firedtimes": 1,
+    "groups": ["web", "defacement"]
+  },
+  "agent": {
+    "id": "001",
+    "name": "web-server",
+    "ip": "192.168.1.10"
+  },
+  "manager": {
+    "name": "wazuh-manager"
+  },
+  "id": "1701420922.123456",
+  "decoder": {
+    "name": "syscheck_integrity_changed"
+  },
+  "data": {
+    "path": "/var/www/html/index.php",
+    "mode": "modified",
+    "changed_attributes": ["md5", "sha1", "sha256", "size"],
+    "md5_before": "abcdef123456789",
+    "md5_after": "fedcba987654321",
+    "size_before": "1024",
+    "size_after": "2048"
+  },
+  "location": "syscheck"
+}
+--> 
