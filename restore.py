@@ -2,7 +2,7 @@
 
 """
 Script Restore untuk Sistem Anti-Defacement Web Server
-Dapat diintegrasikan dengan Wazuh sebagai respons insiden
+Dapat diintegrasikan dengan Wazuh sebagai respons insiden (meskipun restore_auto.py lebih diutamakan untuk AR)
 """
 
 import os
@@ -15,19 +15,30 @@ import logging
 import getpass
 import datetime
 import git
-import requests
 from pathlib import Path
+import shutil # Untuk operasi file seperti copytree, rmtree
+import glob # Untuk mencari file backup
+import tarfile # Untuk ekstraksi arsip
 
 # Konfigurasi logging
+LOG_FILE = '/var/log/web-restore.log' # Log berbeda dari restore_auto.py
+try:
+    os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+except OSError as e:
+    sys.stderr.write(f"Warning: Tidak dapat membuat direktori log {os.path.dirname(LOG_FILE)}. Error: {e}\n")
+
+# Handler logging
+handlers_list = [logging.FileHandler(LOG_FILE)]
+# Tambahkan StreamHandler hanya jika tidak ada argumen --auto atau --alert untuk menghindari output ganda
+if not any(arg in sys.argv for arg in ['--auto', '--alert']):
+    handlers_list.append(logging.StreamHandler(sys.stdout))
+
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler('/var/log/web-restore.log')
-    ]
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=handlers_list
 )
-logger = logging.getLogger('web-restore')
+logger = logging.getLogger('web-restore-interactive') # Nama logger berbeda
 
 # Warna untuk output terminal
 class Colors:
@@ -39,11 +50,13 @@ class Colors:
     ENDC = '\033[0m'
     BOLD = '\033[1m'
 
+CONFIG_FILE = "/etc/web-backup/config.conf"
+
 def print_banner():
     """Menampilkan banner aplikasi"""
     banner = """
 =================================================================
-      RESTORE SISTEM ANTI-DEFACEMENT WEB SERVER
+      RESTORE INTERAKTIF - SISTEM ANTI-DEFACEMENT WEB SERVER
 =================================================================
     """
     print(Colors.HEADER + banner + Colors.ENDC)
@@ -51,206 +64,395 @@ def print_banner():
 def error_exit(message):
     """Menampilkan pesan error dan keluar"""
     logger.error(message)
-    print(Colors.FAIL + f"[ERROR] {message}" + Colors.ENDC)
+    # Hanya print ke console jika bukan mode auto/alert yang mungkin outputnya ditangkap
+    if not any(arg in sys.argv for arg in ['--auto', '--alert']):
+        print(Colors.FAIL + f"[ERROR] {message}" + Colors.ENDC)
     sys.exit(1)
 
-def success_msg(message):
+def success_msg(message, is_automated_call=False):
     """Menampilkan pesan sukses"""
     logger.info(message)
-    print(Colors.GREEN + f"[SUCCESS] {message}" + Colors.ENDC)
+    if not is_automated_call:
+        print(Colors.GREEN + f"[SUCCESS] {message}" + Colors.ENDC)
 
-def info_msg(message):
+def info_msg(message, is_automated_call=False):
     """Menampilkan pesan info"""
     logger.info(message)
-    print(Colors.BLUE + f"[INFO] {message}" + Colors.ENDC)
+    if not is_automated_call:
+        print(Colors.BLUE + f"[INFO] {message}" + Colors.ENDC)
+
+def warning_msg(message, is_automated_call=False):
+    """Menampilkan pesan peringatan"""
+    logger.warning(message)
+    if not is_automated_call:
+        print(Colors.WARNING + f"[WARNING] {message}" + Colors.ENDC)
 
 def load_config():
     """Memuat konfigurasi dari file config"""
-    config_file = "/etc/web-backup/config.conf"
-    
-    if not os.path.isfile(config_file):
-        error_exit(f"File konfigurasi tidak ditemukan: {config_file}")
+    if not os.path.isfile(CONFIG_FILE):
+        error_exit(f"File konfigurasi tidak ditemukan: {CONFIG_FILE}") # error_exit akan log dan print jika perlu
     
     config = {}
-    with open(config_file, 'r') as f:
-        for line in f:
-            line = line.strip()
-            if line and '=' in line and not line.startswith('#'):
-                key, value = line.split('=', 1)
-                # Hilangkan tanda kutip
-                config[key] = value.strip('"\'')
+    try:
+        with open(CONFIG_FILE, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                if '=' in line:
+                    parts = line.split('=', 1)
+                    key = parts[0].strip()
+                    value = parts[1].strip().strip('"\'')
+                    
+                    if key == "DYNAMIC_DIRS":
+                        if value.startswith('(') and value.endswith(')'):
+                            value_cleaned = value[1:-1].strip()
+                            config[key] = [item.strip().strip('"\'') for item in value_cleaned.split()]
+                        else:
+                            logger.warning(f"Format DYNAMIC_DIRS tidak sesuai di config: {value}. Harusnya array bash.")
+                            config[key] = []
+                    else:
+                        config[key] = value
+    except Exception as e:
+        error_exit(f"Error membaca konfigurasi '{CONFIG_FILE}': {str(e)}")
     
+    # Validasi kunci dasar yang selalu dibutuhkan
+    required_keys_base = ["WEB_DIR", "PASSWORD", "MONITOR_IP", "MONITOR_USER", "REMOTE_GIT_BACKUP_PATH", "SSH_IDENTITY_FILE"]
+    if config.get("BACKUP_DYNAMIC", "false").lower() == "true":
+        required_keys_base.extend(["REMOTE_DYNAMIC_BACKUP_PATH", "LOCAL_DYNAMIC_RESTORE_CACHE_DIR", "DYNAMIC_DIRS"])
+
+    missing_keys = [key for key in required_keys_base if key not in config or not config[key]]
+    if missing_keys:
+        error_exit(f"Variabel konfigurasi berikut hilang atau kosong di '{CONFIG_FILE}': {', '.join(missing_keys)}")
+        
     return config
 
-def verify_password(stored_password):
-    """Verifikasi password yang dimasukkan pengguna"""
+def verify_password_interactive(stored_password_b64):
+    """Verifikasi password yang dimasukkan pengguna untuk mode interaktif"""
     try:
         password = getpass.getpass("Masukkan password restore: ")
         encoded_password = base64.b64encode(password.encode()).decode()
         
-        if encoded_password != stored_password:
+        if encoded_password != stored_password_b64:
             error_exit("Password salah!")
-        
         return True
     except KeyboardInterrupt:
         error_exit("\nOperasi dibatalkan oleh pengguna.")
     except Exception as e:
         error_exit(f"Error saat verifikasi password: {str(e)}")
 
-def restore_from_backup(web_dir, commit_id=None):
-    """Restore dari backup Git"""
+def create_pre_restore_backup(web_dir, is_automated_call=False):
+    """Membuat backup dari keadaan saat ini sebelum restore."""
     try:
-        if not os.path.isdir(web_dir):
-            error_exit(f"Direktori web server tidak ditemukan: {web_dir}")
-        
-        repo_path = os.path.join(web_dir, ".git")
-        if not os.path.isdir(repo_path):
-            error_exit(f"Repository Git tidak ditemukan di: {web_dir}")
-        
-        info_msg(f"Memulai proses restore untuk direktori: {web_dir}")
-        
-        # Masuk ke direktori web
-        os.chdir(web_dir)
-        
-        # Membuat backup dari keadaan saat ini sebelum restore
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        backup_dir = f"/tmp/web_defaced_{timestamp}"
-        info_msg(f"Membuat backup kondisi sebelum restore di: {backup_dir}")
-        subprocess.run(f"mkdir -p {backup_dir} && cp -r {web_dir}/* {backup_dir}/", shell=True, check=True)
+        backup_target_dir = f"/tmp/web_content_prerestore_{timestamp}"
+        info_msg(f"Membuat backup kondisi saat ini (sebelum restore) di: {backup_target_dir}", is_automated_call)
         
-        # Inisialisasi repository Git
-        repo = git.Repo(web_dir)
+        # Menggunakan shutil.copytree untuk menyalin direktori
+        shutil.copytree(web_dir, backup_target_dir, symlinks=True, dirs_exist_ok=True) # dirs_exist_ok baru di Py 3.8+
+        # Alternatif jika Python < 3.8 atau dirs_exist_ok tidak diinginkan:
+        # os.makedirs(backup_target_dir, exist_ok=True)
+        # subprocess.run(f"cp -a {web_dir}/* {backup_target_dir}/", shell=True, check=True, capture_output=True)
+
+        success_msg(f"Backup kondisi pra-restore berhasil dibuat di {backup_target_dir}", is_automated_call)
+        return backup_target_dir
+    except Exception as e:
+        warning_msg(f"Gagal membuat backup kondisi pra-restore: {str(e)}. Restore akan tetap dilanjutkan.", is_automated_call)
+        return None
+
+def get_commit_selection_interactive(repo, is_automated_call=False):
+    """Interaktif meminta pengguna memilih commit atau otomatis jika auto mode."""
+    try:
+        commits = list(repo.iter_commits('master', max_count=20)) # Tampilkan lebih banyak untuk interaktif
+        if not commits:
+            error_exit("Tidak ada commit yang tersedia di repository Git.")
+
+        if is_automated_call: # Mode otomatis/alert
+            selected_commit = commits[1] if len(commits) > 1 else commits[0]
+            info_msg(f"Mode otomatis: Memilih commit '{selected_commit.hexsha[:8]}' - {selected_commit.message.strip()}", is_automated_call)
+            return selected_commit
+
+        # Mode interaktif
+        print("\n" + Colors.BOLD + "Daftar 20 commit terakhir (dari terbaru ke terlama):" + Colors.ENDC)
+        print("======================================================")
+        for i, commit in enumerate(commits):
+            commit_time = datetime.datetime.fromtimestamp(commit.committed_date).strftime('%Y-%m-%d %H:%M:%S')
+            print(f"{Colors.GREEN}{i+1}.{Colors.ENDC} [{commit_time}] {Colors.YELLOW}{commit.hexsha[:8]}{Colors.ENDC} - {commit.message.strip()}")
         
-        # Tampilkan daftar commit terbaru
-        if not commit_id:
-            info_msg("Commit terbaru (dari yang terbaru ke yang lama):")
-            commits = list(repo.iter_commits('master', max_count=5))
-            for i, commit in enumerate(commits):
-                commit_time = datetime.datetime.fromtimestamp(commit.committed_date).strftime('%Y-%m-%d %H:%M:%S')
-                print(f"{i+1}. {commit.hexsha[:8]} - {commit_time} - {commit.message}")
-            
-            # Minta pengguna untuk memilih commit
+        while True:
             try:
-                choice = int(input("\nPilih nomor commit untuk restore [1]: ") or "1")
-                if choice < 1 or choice > len(commits):
-                    error_exit(f"Pilihan tidak valid: {choice}")
-                selected_commit = commits[choice-1]
+                choice_str = input(Colors.BOLD + "\nPilih nomor commit untuk restore (default: 1 untuk terbaru, atau 2 untuk kedua terbaru): " + Colors.ENDC)
+                if not choice_str: # Jika pengguna hanya menekan Enter
+                    choice = 1 
+                else:
+                    choice = int(choice_str)
+
+                if 1 <= choice <= len(commits):
+                    selected_commit = commits[choice-1]
+                    break
+                else:
+                    print(Colors.WARNING + "Nomor tidak valid. Coba lagi." + Colors.ENDC)
             except ValueError:
-                selected_commit = commits[0]
-        else:
-            # Gunakan commit ID yang diberikan
-            try:
-                selected_commit = repo.commit(commit_id)
-            except Exception as e:
-                error_exit(f"Commit ID tidak valid: {commit_id}")
+                print(Colors.WARNING + "Masukkan nomor yang valid." + Colors.ENDC)
+            except KeyboardInterrupt:
+                error_exit("\nOperasi dibatalkan oleh pengguna.")
         
-        # Konfirmasi restore
-        commit_time = datetime.datetime.fromtimestamp(selected_commit.committed_date).strftime('%Y-%m-%d %H:%M:%S')
-        info_msg(f"Akan melakukan restore ke commit: {selected_commit.hexsha[:8]} - {commit_time}")
+        commit_time_sel = datetime.datetime.fromtimestamp(selected_commit.committed_date).strftime('%Y-%m-%d %H:%M:%S')
+        info_msg(f"Anda akan melakukan restore ke commit:\n  ID: {selected_commit.hexsha[:8]}\n  Pesan: {selected_commit.message.strip()}\n  Tanggal: {commit_time_sel}")
         confirm = input("Apakah Anda yakin ingin melanjutkan? (y/n): ")
-        
         if confirm.lower() != 'y':
-            error_exit("Operasi restore dibatalkan oleh pengguna.")
+            error_exit("Operasi restore Git dibatalkan oleh pengguna.")
+        return selected_commit
+    except git.exc.GitCommandError as e:
+        error_exit(f"Git error saat mengambil daftar commit: {str(e)}")
+    except KeyboardInterrupt:
+        error_exit("\nOperasi dibatalkan oleh pengguna.")
+
+
+def restore_git_content(web_dir, selected_commit, is_automated_call=False):
+    """Pulihkan konten web dari commit Git tertentu."""
+    try:
+        os.chdir(web_dir)
+        repo = git.Repo(web_dir) 
         
-        # Proses restore
-        info_msg("Proses restore dimulai...")
-        
-        # Reset hard ke commit yang dipilih
+        info_msg(f"Melakukan Git reset --hard ke commit: {selected_commit.hexsha[:8]}", is_automated_call)
         repo.git.reset('--hard', selected_commit.hexsha)
         
-        # Bersihkan file yang tidak terlacak
-        repo.git.clean('-fd')
+        info_msg("Membersihkan file yang tidak terlacak (git clean -fdx)...", is_automated_call)
+        repo.git.clean('-fdx')
         
-        success_msg(f"Restore berhasil diselesaikan ke commit {selected_commit.hexsha[:8]}")
+        success_msg(f"Konten Git berhasil dipulihkan ke commit {selected_commit.hexsha[:8]}", is_automated_call)
         return True
-    
-    except git.GitCommandError as e:
-        error_exit(f"Git error: {str(e)}")
     except Exception as e:
-        error_exit(f"Error saat restore: {str(e)}")
+        error_exit(f"Gagal melakukan restore Git: {str(e)}") # error_exit sudah handle logging
 
-def wazuh_integration(web_dir, alert_data=None):
-    """Fungsi untuk integrasi dengan Wazuh"""
-    try:
-        # Jika ada data alert dari Wazuh
-        if alert_data:
-            try:
-                alert = json.loads(alert_data)
-                
-                # Ekstrak informasi dari alert Wazuh
-                rule_id = alert.get('rule', {}).get('id')
-                rule_description = alert.get('rule', {}).get('description')
-                source_ip = alert.get('data', {}).get('srcip')
-                
-                info_msg(f"Menerima alert Wazuh Rule ID: {rule_id}")
-                info_msg(f"Deskripsi: {rule_description}")
-                info_msg(f"IP Sumber: {source_ip}")
-                
-                # Lakukan restore otomatis
-                return restore_from_backup(web_dir)
-            
-            except json.JSONDecodeError:
-                error_exit("Format data Wazuh tidak valid.")
-        
-        # Jika dijalankan manual, lakukan restore interaktif
-        return restore_from_backup(web_dir)
+# --- Fungsi untuk Restore Dinamis (mirip dengan restore_auto.py) ---
+def fetch_dynamic_archives_from_remote(config, is_automated_call=False):
+    """Mengambil arsip file dinamis dari server monitoring ke cache lokal."""
+    info_msg("Memulai pengambilan arsip file dinamis dari server monitoring...", is_automated_call)
     
+    monitor_ip = config['MONITOR_IP']
+    monitor_user = config['MONITOR_USER']
+    remote_path = config['REMOTE_DYNAMIC_BACKUP_PATH'].rstrip('/') + '/'
+    local_cache_dir = config['LOCAL_DYNAMIC_RESTORE_CACHE_DIR']
+    ssh_identity_file = config['SSH_IDENTITY_FILE']
+
+    if not os.path.exists(local_cache_dir):
+        try:
+            os.makedirs(local_cache_dir, exist_ok=True)
+            info_msg(f"Direktori cache restore dinamis dibuat: {local_cache_dir}", is_automated_call)
+        except Exception as e:
+            warning_msg(f"Gagal membuat direktori cache '{local_cache_dir}': {e}. Restore dinamis mungkin gagal.", is_automated_call)
+            return False
+    else:
+        info_msg(f"Membersihkan cache restore dinamis lama di '{local_cache_dir}'...", is_automated_call)
+        for item in os.listdir(local_cache_dir):
+            item_path = os.path.join(local_cache_dir, item)
+            try:
+                if os.path.isfile(item_path) or os.path.islink(item_path): os.unlink(item_path)
+                elif os.path.isdir(item_path): shutil.rmtree(item_path)
+            except Exception as e:
+                warning_msg(f"Gagal menghapus item cache lama '{item_path}': {e}", is_automated_call)
+
+    if not shutil.which("rsync"):
+        error_exit("'rsync' tidak ditemukan. Tidak dapat mengambil file dinamis.")
+        return False
+
+    rsync_cmd = [
+        "rsync", "-avz", "--include=*.tar.gz", "--exclude=*",
+        "-e", f"ssh -i {ssh_identity_file} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR",
+        f"{monitor_user}@{monitor_ip}:{remote_path}",
+        local_cache_dir
+    ]
+    info_msg(f"Menjalankan rsync untuk mengambil arsip dinamis...", is_automated_call)
+    logger.debug(f"Perintah Rsync: {' '.join(rsync_cmd)}")
+    try:
+        process = subprocess.run(rsync_cmd, capture_output=True, text=True, check=False)
+        if process.returncode == 0:
+            success_msg("Rsync berhasil mengambil arsip dinamis ke cache lokal.", is_automated_call)
+            return True
+        else:
+            logger.error(f"Rsync gagal dengan kode {process.returncode}. Stdout: {process.stdout}. Stderr: {process.stderr}")
+            warning_msg(f"Rsync gagal mengambil arsip dinamis. Kode: {process.returncode}.", is_automated_call)
+            return False
     except Exception as e:
-        error_exit(f"Error pada integrasi Wazuh: {str(e)}")
+        warning_msg(f"Error saat menjalankan rsync: {e}. Restore dinamis mungkin gagal.", is_automated_call)
+        return False
+
+def restore_dynamic_files_from_cache(config, is_automated_call=False):
+    """Memulihkan file dinamis dari cache lokal yang sudah di-fetch."""
+    if not config.get("BACKUP_DYNAMIC", "false").lower() == "true":
+        info_msg("Restore file dinamis tidak diaktifkan dalam konfigurasi.", is_automated_call)
+        return True
+
+    info_msg("Memulai proses restore file dinamis dari cache lokal...", is_automated_call)
+    web_dir = config['WEB_DIR']
+    local_cache_dir = config['LOCAL_DYNAMIC_RESTORE_CACHE_DIR']
+    dynamic_dirs_config = config.get('DYNAMIC_DIRS', [])
+
+    if not dynamic_dirs_config:
+        info_msg("Tidak ada DYNAMIC_DIRS yang dikonfigurasi untuk direstore.", is_automated_call)
+        return True
+
+    all_restored_successfully = True
+    for dir_name_in_config in dynamic_dirs_config:
+        archive_base_name = dir_name_in_config.replace('/', '_')
+        archive_pattern = os.path.join(local_cache_dir, f"{archive_base_name}_*.tar.gz")
+        found_archives = glob.glob(archive_pattern)
+
+        if not found_archives:
+            warning_msg(f"Tidak ada arsip backup ditemukan di cache untuk '{dir_name_in_config}'.", is_automated_call)
+            continue
+
+        latest_archive = max(found_archives, key=os.path.getmtime)
+        target_path_for_dir = os.path.join(web_dir, dir_name_in_config)
+        info_msg(f"Merestore '{dir_name_in_config}' dari arsip: '{os.path.basename(latest_archive)}'", is_automated_call)
+        
+        try:
+            if os.path.lexists(target_path_for_dir):
+                info_msg(f"Menghapus '{target_path_for_dir}' yang ada sebelum ekstraksi...", is_automated_call)
+                if os.path.isdir(target_path_for_dir) and not os.path.islink(target_path_for_dir):
+                    shutil.rmtree(target_path_for_dir)
+                else:
+                    os.unlink(target_path_for_dir)
+            
+            # Pastikan parent directory ada sebelum ekstraksi
+            os.makedirs(os.path.dirname(target_path_for_dir), exist_ok=True)
+
+            with tarfile.open(latest_archive, "r:gz") as tar:
+                tar.extractall(path=web_dir)
+            success_msg(f"Berhasil merestore '{dir_name_in_config}'.", is_automated_call)
+
+            web_server_user = config.get('WEB_SERVER_USER')
+            web_server_group = config.get('WEB_SERVER_GROUP')
+            if web_server_user and web_server_group and os.path.exists(target_path_for_dir):
+                try:
+                    for dirpath, dirnames, filenames in os.walk(target_path_for_dir):
+                        shutil.chown(dirpath, user=web_server_user, group=web_server_group)
+                        for filename in filenames:
+                            shutil.chown(os.path.join(dirpath, filename), user=web_server_user, group=web_server_group)
+                    info_msg(f"Kepemilikan untuk '{target_path_for_dir}' diatur ke {web_server_user}:{web_server_group}", is_automated_call)
+                except Exception as e_chown:
+                    warning_msg(f"Gagal mengatur kepemilikan untuk '{target_path_for_dir}': {e_chown}", is_automated_call)
+            
+        except Exception as e:
+            warning_msg(f"Gagal merestore '{dir_name_in_config}' dari '{latest_archive}': {e}", is_automated_call)
+            all_restored_successfully = False
+            
+    if all_restored_successfully:
+        success_msg("Restore file dinamis dari cache selesai.", is_automated_call)
+    else:
+        warning_msg("Beberapa file/direktori dinamis mungkin gagal direstore.", is_automated_call)
+    return all_restored_successfully
+# --- Akhir fungsi Restore Dinamis ---
+
 
 def main():
-    """Fungsi utama program"""
-    parser = argparse.ArgumentParser(description="Web Server Anti-Defacement Restore Tool")
-    parser.add_argument("--alert", help="Data alert dari Wazuh dalam format JSON")
-    parser.add_argument("--commit", help="ID commit untuk restore langsung")
-    parser.add_argument("--auto", action="store_true", help="Mode otomatis tanpa interaksi pengguna")
+    parser = argparse.ArgumentParser(description="Web Server Anti-Defacement Interactive Restore Tool")
+    parser.add_argument("--alert", type=str, help="Data alert dari Wazuh dalam format JSON (untuk mode otomatis terbatas)")
+    parser.add_argument("--commit", type=str, help="ID commit spesifik untuk restore (mode manual, akan tetap meminta konfirmasi)")
+    parser.add_argument("--auto", action="store_true", help="Mode otomatis penuh: restore Git ke commit aman terakhir & restore dinamis jika aktif (melewati password & interaksi)")
     args = parser.parse_args()
     
-    # Tampilkan banner jika tidak dalam mode otomatis
-    if not args.auto:
+    is_automated_call = args.auto or bool(args.alert) # bool(args.alert) true jika argumen diberikan
+
+    if not is_automated_call:
         print_banner()
     
-    # Verifikasi root
-    if os.geteuid() != 0:
-        error_exit("Script ini harus dijalankan sebagai root.")
+    if os.geteuid() != 0 and not any(arg in sys.argv for arg in ['--non-root']): # non-root adalah flag imajiner dari restore_auto
+        error_exit("Script ini umumnya perlu dijalankan sebagai root untuk operasi file sistem.")
+            
+    try:
+        config = load_config()
+    except SystemExit: # Error sudah di-log oleh load_config
+        sys.exit(1) # Pastikan keluar
+        
+    web_dir = config['WEB_DIR']
+
+    if not is_automated_call: # Hanya minta password jika interaktif penuh
+        verify_password_interactive(config['PASSWORD'])
+
+    # Buat backup lokal dari kondisi saat ini SEBELUM melakukan restore apapun
+    # Hanya jika bukan panggilan otomatis dari AR yang mungkin sudah ada mekanisme lain
+    if not is_automated_call:
+         create_pre_restore_backup(web_dir, is_automated_call)
     
-    # Muat konfigurasi
-    config = load_config()
-    web_dir = config.get('WEB_DIR')
-    stored_password = config.get('PASSWORD')
-    
-    if not web_dir or not stored_password:
-        error_exit("Konfigurasi tidak lengkap. Jalankan kembali script instalasi.")
-    
-    # Verifikasi password jika tidak dalam mode otomatis dengan alert Wazuh
-    if not (args.auto and args.alert):
-        verify_password(stored_password)
-    
-    # Eksekusi restore berdasarkan mode
-    if args.alert:
-        wazuh_integration(web_dir, args.alert)
-    elif args.commit:
-        restore_from_backup(web_dir, args.commit)
-    else:
-        restore_from_backup(web_dir)
-    
-    # Menampilkan statistik restore
-    if not args.auto:
-        print("\nStatistik Restore:")
-        print("----------------")
+    # 1. Restore Konten Statis dari Git
+    info_msg(f"Memulai proses restore Git untuk direktori web: {web_dir}", is_automated_call)
+    try:
         repo = git.Repo(web_dir)
-        current_commit = repo.head.commit
-        commit_time = datetime.datetime.fromtimestamp(current_commit.committed_date).strftime('%Y-%m-%d %H:%M:%S')
-        
-        print(f"Direktori web: {web_dir}")
-        print(f"Restore ke commit: {current_commit.hexsha[:8]}")
-        print(f"Commit timestamp: {commit_time}")
-        print(f"Commit message: {current_commit.message}")
-        print(f"Jumlah file dalam restore: {len(list(repo.git.ls_files().split()))}")
-        
-        print("\n=================================================================")
-        print("      RESTORE SELESAI                                           ")
-        print("=================================================================")
+    except git.exc.InvalidGitRepositoryError:
+        error_exit(f"Repository Git tidak valid atau tidak ditemukan di {web_dir}.")
+    except Exception as e_repo:
+        error_exit(f"Gagal mengakses repository Git di {web_dir}: {e_repo}")
+
+    selected_commit_obj = None
+    if args.commit and not is_automated_call: # Mode interaktif dengan commit spesifik
+        try:
+            selected_commit_obj = repo.commit(args.commit)
+            info_msg(f"Commit spesifik '{args.commit}' akan digunakan setelah konfirmasi.", is_automated_call)
+            # Konfirmasi akan diminta di dalam get_commit_selection_interactive jika flownya dimodifikasi
+            # Untuk sekarang, jika --commit diberikan, kita asumsikan pengguna tahu apa yang dilakukan dan konfirmasi tetap ada
+            # Namun, get_commit_selection_interactive akan menampilkan daftar. Lebih baik proses commit spesifik di sini.
+            commit_time_sel = datetime.datetime.fromtimestamp(selected_commit_obj.committed_date).strftime('%Y-%m-%d %H:%M:%S')
+            info_msg(f"Akan melakukan restore ke commit spesifik:\n  ID: {selected_commit_obj.hexsha[:8]}\n  Pesan: {selected_commit_obj.message.strip()}\n  Tanggal: {commit_time_sel}", is_automated_call)
+            if not is_automated_call:
+                confirm = input("Apakah Anda yakin ingin melanjutkan dengan commit ini? (y/n): ")
+                if confirm.lower() != 'y':
+                    error_exit("Operasi restore Git dibatalkan oleh pengguna.")
+        except Exception as e:
+            error_exit(f"Commit ID '{args.commit}' tidak valid atau tidak ditemukan: {e}")
+    else: # Mode interaktif standar atau mode otomatis
+        selected_commit_obj = get_commit_selection_interactive(repo, is_automated_call)
+    
+    if not selected_commit_obj:
+        error_exit("Gagal memilih commit untuk restore Git.")
+
+    git_restore_success = restore_git_content(web_dir, selected_commit_obj, is_automated_call)
+    if not git_restore_success:
+        error_exit("Restore konten Git gagal. Proses dihentikan.") # error_exit akan keluar
+    
+    # 2. Restore File Dinamis
+    dynamic_restore_success = True # Anggap sukses jika tidak diaktifkan atau tidak dijalankan
+    if config.get("BACKUP_DYNAMIC", "false").lower() == "true":
+        if not is_automated_call: # Tanya pengguna jika interaktif
+            confirm_dynamic = input(Colors.BOLD + "\nApakah Anda ingin mencoba merestore file dinamis (misalnya, uploads, cache) dari backup terakhir? (y/n): " + Colors.ENDC)
+            if confirm_dynamic.lower() != 'y':
+                info_msg("Restore file dinamis dilewati oleh pengguna.", is_automated_call)
+            else:
+                if fetch_dynamic_archives_from_remote(config, is_automated_call):
+                    dynamic_restore_success = restore_dynamic_files_from_cache(config, is_automated_call)
+                else:
+                    warning_msg("Gagal mengambil arsip dinamis dari remote. Restore file dinamis tidak dapat dilanjutkan.", is_automated_call)
+                    dynamic_restore_success = False
+        elif is_automated_call: # Otomatis jika --auto atau --alert
+            info_msg("Mode otomatis: Mencoba restore file dinamis...", is_automated_call)
+            if fetch_dynamic_archives_from_remote(config, is_automated_call):
+                dynamic_restore_success = restore_dynamic_files_from_cache(config, is_automated_call)
+            else:
+                warning_msg("Gagal mengambil arsip dinamis dari remote (mode otomatis). Restore dinamis gagal.", is_automated_call)
+                dynamic_restore_success = False
+
+
+    if git_restore_success and dynamic_restore_success:
+        success_msg("Proses restore (Git dan Dinamis jika dijalankan) selesai.", is_automated_call)
+        if not is_automated_call:
+            # Menampilkan statistik restore
+            print("\n" + Colors.BOLD + "Statistik Restore Akhir:" + Colors.ENDC)
+            print("------------------------")
+            current_commit_info = repo.head.commit
+            commit_time_info = datetime.datetime.fromtimestamp(current_commit_info.committed_date).strftime('%Y-%m-%d %H:%M:%S')
+            print(f"Direktori web: {Colors.YELLOW}{web_dir}{Colors.ENDC}")
+            print(f"Restore Git ke commit: {Colors.YELLOW}{current_commit_info.hexsha[:8]}{Colors.ENDC}")
+            print(f"  Timestamp commit: {commit_time_info}")
+            print(f"  Pesan commit: {current_commit_info.message.strip()}")
+            print(f"  File dinamis direstore: {'Ya' if config.get('BACKUP_DYNAMIC', 'false').lower() == 'true' and dynamic_restore_success and (is_automated_call or confirm_dynamic.lower() == 'y') else 'Tidak/Dilewati/Gagal'}")
+            print("\n=================================================================")
+            print(Colors.BOLD + "      RESTORE SELESAI                                           " + Colors.ENDC)
+            print("=================================================================")
+        sys.exit(0)
+    else:
+        error_exit("Satu atau lebih bagian dari proses restore gagal. Periksa log untuk detail.")
 
 if __name__ == "__main__":
-    main() 
+    main()
