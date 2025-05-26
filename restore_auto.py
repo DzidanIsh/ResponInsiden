@@ -11,342 +11,383 @@ import getpass
 import base64
 import datetime
 import git
-import paramiko
+# paramiko tidak digunakan lagi jika kita beralih ke rsync/scp via subprocess untuk restore dinamis
+# import paramiko 
 import logging
 from pathlib import Path
 import glob
 import tarfile
+import subprocess # Untuk menjalankan rsync atau scp
 
 # Konfigurasi logging
 def setup_logging():
-    log_dir = "/var/log/wazuh/active-response"
+    log_dir = "/var/log/wazuh/active-response" # Sesuai dengan yang di install.sh
     if not os.path.exists(log_dir):
-        os.makedirs(log_dir, exist_ok=True)
+        try:
+            os.makedirs(log_dir, exist_ok=True)
+            # Izin diatur oleh install.sh, tapi pastikan wazuh bisa tulis jika script ini dijalankan sbg wazuh
+            # os.chown(log_dir, wazuh_uid, wazuh_gid) # Perlu UID/GID wazuh
+            # os.chmod(log_dir, 0o750)
+        except Exception as e:
+            # Tidak bisa print ke stderr jika ini bagian dari AR yang outputnya ditangkap
+            # sys.stderr.write(f"Warning: Gagal membuat direktori log {log_dir}: {e}\n")
+            pass # Biarkan logging ke stdout jika file handler gagal
+
+    log_file_path = os.path.join(log_dir, 'restore_auto.log')
     
+    # Hapus StreamHandler jika tidak ingin output ganda ke stdout saat dipanggil dari web_restore.sh
+    # Karena web_restore.sh sudah mengarahkan stdout & stderr ke restore_ar.log
+    # Namun, untuk pemanggilan manual, StreamHandler berguna.
+    # Mungkin buat kondisi berdasarkan apakah --alert diberikan.
+    handlers_list = [logging.FileHandler(log_file_path)]
+    if not any(arg in sys.argv for arg in ['--auto', '--alert']): # Hanya tambah StreamHandler jika bukan auto/alert
+        handlers_list.append(logging.StreamHandler(sys.stdout))
+
     logging.basicConfig(
         level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.StreamHandler(sys.stdout),
-            logging.FileHandler(f'{log_dir}/restore_auto.log')
-        ]
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', # Menggunakan name logger
+        handlers=handlers_list
     )
-    return logging.getLogger('web-restore')
+    return logging.getLogger('restore_auto') # Menggunakan nama logger spesifik
 
 logger = setup_logging()
 
-# Konfigurasi
 CONFIG_FILE = "/etc/web-backup/config.conf"
-
-def error_exit(message):
-    """Tampilkan pesan error dan keluar"""
-    print(f"\033[31m[ERROR] {message}\033[0m")
-    sys.exit(1)
-
-def success_msg(message):
-    """Tampilkan pesan sukses"""
-    print(f"\033[32m[SUCCESS] {message}\033[0m")
-
-def info_msg(message):
-    """Tampilkan pesan info"""
-    print(f"\033[34m[INFO] {message}\033[0m")
 
 def load_config():
     """Memuat konfigurasi dari file config"""
-    config_file = "/etc/web-backup/config.conf"
-    
-    if not os.path.isfile(config_file):
-        logger.error(f"File konfigurasi tidak ditemukan: {config_file}")
+    if not os.path.isfile(CONFIG_FILE):
+        logger.critical(f"File konfigurasi tidak ditemukan: {CONFIG_FILE}")
         sys.exit(1)
     
     config = {}
     try:
-        with open(config_file, 'r') as f:
+        with open(CONFIG_FILE, 'r') as f:
             for line in f:
                 line = line.strip()
-                if line and '=' in line and not line.startswith('#'):
-                    key, value = line.split('=', 1)
-                    config[key.strip()] = value.strip().strip('"\'')
+                if not line or line.startswith('#'):
+                    continue
+                if '=' in line:
+                    parts = line.split('=', 1)
+                    key = parts[0].strip()
+                    value = parts[1].strip().strip('"\'')
+                    
+                    # Khusus untuk DYNAMIC_DIRS yang merupakan array bash
+                    if key == "DYNAMIC_DIRS":
+                        # Hapus tanda kurung dan pisahkan berdasarkan spasi
+                        # Contoh: DYNAMIC_DIRS=("uploads" "cache" "tmp")
+                        if value.startswith('(') and value.endswith(')'):
+                            value_cleaned = value[1:-1].strip()
+                            # Pisahkan item yang mungkin mengandung quote, lalu hapus quote
+                            config[key] = [item.strip().strip('"\'') for item in value_cleaned.split()]
+                        else: # Jika format tidak sesuai, simpan sebagai string atau kosongkan
+                            logger.warning(f"Format DYNAMIC_DIRS tidak sesuai di config: {value}. Harusnya array bash.")
+                            config[key] = []
+                    else:
+                        config[key] = value
     except Exception as e:
-        logger.error(f"Error membaca konfigurasi: {str(e)}")
+        logger.critical(f"Error membaca konfigurasi '{CONFIG_FILE}': {str(e)}", exc_info=True)
         sys.exit(1)
     
+    required_keys = ["WEB_DIR", "MONITOR_IP", "MONITOR_USER", "REMOTE_GIT_BACKUP_PATH", "SSH_IDENTITY_FILE"]
+    if config.get("BACKUP_DYNAMIC", "false").lower() == "true":
+        required_keys.extend(["REMOTE_DYNAMIC_BACKUP_PATH", "LOCAL_DYNAMIC_RESTORE_CACHE_DIR", "DYNAMIC_DIRS"])
+
+    missing_keys = [key for key in required_keys if key not in config or not config[key]]
+    if missing_keys:
+        logger.critical(f"Variabel konfigurasi berikut hilang atau kosong di '{CONFIG_FILE}': {', '.join(missing_keys)}")
+        sys.exit(1)
+        
     return config
 
-def verify_password(config, auto_mode=False):
-    """Verifikasi password pengguna"""
-    if auto_mode:
-        # Dalam mode otomatis, kita lewati verifikasi password
+def verify_password_interactive(config_password_b64):
+    """Verifikasi password pengguna untuk mode interaktif"""
+    try:
+        input_password = getpass.getpass("Masukkan password restore: ")
+        input_encoded = base64.b64encode(input_password.encode()).decode()
+        
+        if input_encoded != config_password_b64:
+            logger.error("Password salah!")
+            sys.exit(1)
         return True
-    
-    encoded_password = config['PASSWORD']
-    input_password = getpass.getpass("Masukkan password restore: ")
-    input_encoded = base64.b64encode(input_password.encode()).decode()
-    
-    if input_encoded != encoded_password:
-        error_exit("Password salah!")
-    
-    return True
-
-def fetch_commits(config):
-    """Ambil daftar commit dari repository Git"""
-    web_dir = config['WEB_DIR']
-    
-    try:
-        repo = git.Repo(web_dir)
-        # Dapatkan daftar commit
-        commits = list(repo.iter_commits('master', max_count=20))
-        return commits
-    except git.exc.InvalidGitRepositoryError:
-        error_exit(f"Repository Git tidak ditemukan di {web_dir}")
     except Exception as e:
-        error_exit(f"Gagal mengakses repository Git: {str(e)}")
+        logger.error(f"Error saat verifikasi password: {e}")
+        sys.exit(1)
 
-def backup_current_state(web_dir, backup_dir):
-    """Backup kondisi saat ini sebelum restore"""
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    backup_path = os.path.join(backup_dir, f"pre_restore_backup_{timestamp}")
-    
+def get_latest_commit_for_restore(repo):
+    """Pilih commit terakhir yang valid untuk restore otomatis (biasanya kedua terakhir)."""
     try:
-        os.makedirs(backup_path, exist_ok=True)
-        os.system(f"cp -r {web_dir}/* {backup_path}/")
-        info_msg(f"Kondisi saat ini di-backup ke {backup_path}")
-        return backup_path
-    except Exception as e:
-        info_msg(f"Gagal membuat backup kondisi saat ini: {str(e)}")
+        commits = list(repo.iter_commits('master', max_count=2)) # Ambil 2 commit terakhir
+        if not commits:
+            logger.error("Tidak ada commit yang tersedia di repository Git.")
+            return None
+        
+        # Gunakan commit kedua terakhir jika ada, jika tidak (hanya 1 commit) gunakan yang itu.
+        selected_commit = commits[1] if len(commits) > 1 else commits[0]
+        logger.info(f"Commit dipilih untuk restore Git: {selected_commit.hexsha[:8]} - {selected_commit.message.strip()}")
+        return selected_commit
+    except git.exc.GitCommandError as e:
+        logger.error(f"Gagal mengambil commit dari repository Git: {e}", exc_info=True)
         return None
 
-def restore_from_commit(config, commit, auto_mode=False):
-    """Pulihkan konten web dari commit tertentu"""
-    web_dir = config['WEB_DIR']
-    
+
+def restore_git_content(web_dir, selected_commit):
+    """Pulihkan konten web dari commit Git tertentu."""
     try:
-        # Backup kondisi saat ini (opsional)
-        if not auto_mode:
-            backup_dir = "/tmp/web_restore_backups"
-            backup_current_state(web_dir, backup_dir)
-        
-        # Masuk ke direktori web
         os.chdir(web_dir)
+        repo = git.Repo(web_dir) # Re-inisialisasi repo object setelah chdir
         
-        # Reset ke commit yang dipilih
-        repo = git.Repo(web_dir)
-        info_msg(f"Melakukan restore ke commit: {commit.hexsha[:8]} - {commit.message.strip()}")
-        
-        # Hard reset ke commit yang dipilih
-        repo.git.reset('--hard', commit.hexsha)
-        
-        # Bersihkan file yang tidak terlacak
-        repo.git.clean('-fd')
-        
-        success_msg(f"Restore berhasil dilakukan pada: {datetime.datetime.now()}")
-        
-        # Catat aktivitas restore
-        log_restore_activity(config, commit, auto_mode)
-        
-        return True
-    except Exception as e:
-        error_exit(f"Gagal melakukan restore: {str(e)}")
-
-def log_restore_activity(config, commit, auto_mode):
-    """Catat aktivitas restore ke log"""
-    log_file = "/var/log/web-restore.log"
-    
-    try:
-        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        trigger = "AUTO" if auto_mode else "MANUAL"
-        commit_info = f"{commit.hexsha[:8]} - {commit.message.strip()}"
-        
-        with open(log_file, 'a') as f:
-            f.write(f"{timestamp} - {trigger} RESTORE - Commit: {commit_info}\n")
-    except Exception as e:
-        info_msg(f"Gagal mencatat aktivitas restore: {str(e)}")
-
-def get_latest_good_commit(commits):
-    """Pilih commit terakhir yang dianggap 'aman' untuk restore otomatis"""
-    # Strategi sederhana: pilih commit kedua terakhir
-    # Asumsinya adalah commit terakhir mungkin yang berisi perubahan berbahaya
-    
-    if len(commits) > 1:
-        # Pilih commit kedua terakhir
-        return commits[1]
-    else:
-        # Jika hanya ada 1 commit, gunakan itu
-        return commits[0]
-
-def interactive_restore(config, commits):
-    """Mode interaktif untuk restore"""
-    print("\nDaftar 20 commit terakhir:")
-    print("============================")
-    
-    for i, commit in enumerate(commits):
-        commit_time = datetime.datetime.fromtimestamp(commit.committed_date).strftime("%Y-%m-%d %H:%M:%S")
-        print(f"{i+1}. [{commit_time}] {commit.hexsha[:8]} - {commit.message.strip()}")
-    
-    # Pilih commit
-    while True:
-        try:
-            choice = int(input("\nPilih nomor commit untuk restore (1-20): "))
-            if 1 <= choice <= len(commits):
-                selected_commit = commits[choice-1]
-                break
-            else:
-                print("Nomor tidak valid. Coba lagi.")
-        except ValueError:
-            print("Masukkan nomor yang valid.")
-    
-    # Konfirmasi
-    confirm = input(f"\nAnda akan melakukan restore ke commit:\n[{selected_commit.hexsha[:8]}] {selected_commit.message.strip()}\nLanjutkan? (y/n): ")
-    
-    if confirm.lower() == 'y':
-        restore_from_commit(config, selected_commit)
-    else:
-        print("Restore dibatalkan.")
-
-def auto_restore(config, commits):
-    """Mode otomatis untuk restore tanpa interaksi pengguna"""
-    info_msg("Menjalankan restore otomatis sebagai respons insiden...")
-    
-    # Pilih commit terakhir yang dianggap 'aman'
-    commit = get_latest_good_commit(commits)
-    
-    info_msg(f"Memilih commit aman terakhir untuk restore: {commit.hexsha[:8]} - {commit.message.strip()}")
-    
-    # Lakukan restore
-    restore_from_commit(config, commit, auto_mode=True)
-
-def restore_dynamic_files(config):
-    """Memulihkan file dinamis dari backup terpisah"""
-    try:
-        dynamic_backup_dir = config.get('DYNAMIC_BACKUP_DIR')
-        if not dynamic_backup_dir:
-            logger.warning("Direktori backup dinamis tidak dikonfigurasi")
-            return False
-
-        if not os.path.exists(dynamic_backup_dir):
-            logger.warning(f"Direktori backup dinamis tidak ditemukan: {dynamic_backup_dir}")
-            return False
-
-        # Dapatkan backup terbaru untuk setiap direktori dinamis
-        dynamic_dirs = config.get('DYNAMIC_DIRS', [])
-        for dir_name in dynamic_dirs:
-            # Cari backup terbaru untuk direktori ini
-            backups = glob.glob(os.path.join(dynamic_backup_dir, f"{dir_name}_*.tar.gz"))
-            if not backups:
-                logger.warning(f"Tidak ada backup ditemukan untuk {dir_name}")
-                continue
-
-            # Urutkan berdasarkan waktu modifikasi (terbaru dulu)
-            latest_backup = max(backups, key=os.path.getmtime)
-            
-            # Ekstrak backup
-            target_dir = os.path.join(config['WEB_DIR'], dir_name)
-            if os.path.exists(target_dir):
-                # Backup direktori saat ini sebelum restore
-                backup_timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-                backup_name = f"{dir_name}_pre_restore_{backup_timestamp}.tar.gz"
-                backup_path = os.path.join(dynamic_backup_dir, backup_name)
-                
-                # Buat backup dari direktori saat ini
-                with tarfile.open(backup_path, "w:gz") as tar:
-                    tar.add(target_dir, arcname=dir_name)
-                
-                logger.info(f"Backup {dir_name} saat ini disimpan di {backup_path}")
-            
-            # Ekstrak backup terbaru
-            with tarfile.open(latest_backup, "r:gz") as tar:
-                tar.extractall(path=config['WEB_DIR'])
-            
-            logger.info(f"File dinamis {dir_name} berhasil dipulihkan dari {latest_backup}")
-        
-        return True
-    except Exception as e:
-        logger.error(f"Gagal memulihkan file dinamis: {str(e)}")
-        return False
-
-def restore_from_backup(web_dir, non_root=False):
-    """Restore dari backup Git"""
-    try:
-        if not os.path.isdir(web_dir):
-            logger.error(f"Direktori web server tidak ditemukan: {web_dir}")
-            return False
-        
-        repo_path = os.path.join(web_dir, ".git")
-        if not os.path.isdir(repo_path):
-            logger.error(f"Repository Git tidak ditemukan di: {web_dir}")
-            return False
-        
-        logger.info(f"Memulai proses restore untuk direktori: {web_dir}")
-        
-        # Load konfigurasi
-        config = load_config()
-        
-        # Backup file dinamis sebelum restore
-        if config.get('BACKUP_DYNAMIC', False):
-            logger.info("Memulai backup file dinamis sebelum restore...")
-            restore_dynamic_files(config)
-        
-        # Masuk ke direktori web
-        os.chdir(web_dir)
-        
-        # Inisialisasi repository Git
-        repo = git.Repo(web_dir)
-        
-        # Pilih commit terakhir yang valid
-        commits = list(repo.iter_commits('master', max_count=2))
-        if not commits:
-            logger.error("Tidak ada commit yang tersedia")
-            return False
-        
-        # Gunakan commit kedua terakhir (jika ada) untuk restore
-        selected_commit = commits[1] if len(commits) > 1 else commits[0]
-        
-        logger.info(f"Melakukan restore ke commit: {selected_commit.hexsha[:8]}")
-        
-        # Reset ke commit yang dipilih
+        logger.info(f"Melakukan Git reset --hard ke commit: {selected_commit.hexsha[:8]}")
         repo.git.reset('--hard', selected_commit.hexsha)
         
-        # Bersihkan file yang tidak terlacak
-        repo.git.clean('-fd')
+        logger.info("Membersihkan file yang tidak terlacak (git clean -fd)...")
+        repo.git.clean('-fdx') # -x juga menghapus file yang diabaikan, hati-hati jika .gitignore tidak ketat
         
-        logger.info(f"Restore berhasil ke commit {selected_commit.hexsha[:8]}")
+        logger.info(f"Konten Git berhasil dipulihkan ke commit {selected_commit.hexsha[:8]} pada: {datetime.datetime.now()}")
         return True
-        
     except Exception as e:
-        logger.error(f"Error saat restore: {str(e)}")
+        logger.error(f"Gagal melakukan restore Git: {str(e)}", exc_info=True)
         return False
 
+def fetch_dynamic_archives_from_remote(config):
+    """Mengambil arsip file dinamis dari server monitoring ke cache lokal."""
+    logger.info("Memulai pengambilan arsip file dinamis dari server monitoring...")
+    
+    monitor_ip = config['MONITOR_IP']
+    monitor_user = config['MONITOR_USER']
+    remote_path = config['REMOTE_DYNAMIC_BACKUP_PATH'].rstrip('/') + '/' # Pastikan trailing slash
+    local_cache_dir = config['LOCAL_DYNAMIC_RESTORE_CACHE_DIR']
+    ssh_identity_file = config['SSH_IDENTITY_FILE']
+
+    if not os.path.exists(local_cache_dir):
+        try:
+            os.makedirs(local_cache_dir, exist_ok=True)
+            logger.info(f"Direktori cache restore dinamis dibuat: {local_cache_dir}")
+        except Exception as e:
+            logger.error(f"Gagal membuat direktori cache '{local_cache_dir}': {e}", exc_info=True)
+            return False
+    else: # Bersihkan cache lama sebelum fetch baru
+        logger.info(f"Membersihkan cache restore dinamis lama di '{local_cache_dir}'...")
+        for item in os.listdir(local_cache_dir):
+            item_path = os.path.join(local_cache_dir, item)
+            try:
+                if os.path.isfile(item_path) or os.path.islink(item_path):
+                    os.unlink(item_path)
+                elif os.path.isdir(item_path):
+                    shutil.rmtree(item_path)
+            except Exception as e:
+                logger.warning(f"Gagal menghapus item cache lama '{item_path}': {e}")
+
+
+    # Periksa apakah rsync terinstal
+    if not shutil.which("rsync"):
+        logger.error("Perintah 'rsync' tidak ditemukan. Tidak dapat mengambil file dinamis.")
+        return False
+
+    rsync_cmd = [
+        "rsync",
+        "-avz",
+        "--include=*.tar.gz", # Hanya ambil file tar.gz
+        "--exclude=*",        # Abaikan file lain di direktori remote
+        "-e", f"ssh -i {ssh_identity_file} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR",
+        f"{monitor_user}@{monitor_ip}:{remote_path}",
+        local_cache_dir
+    ]
+
+    logger.info(f"Menjalankan rsync untuk mengambil arsip: {' '.join(rsync_cmd)}")
+    try:
+        process = subprocess.run(rsync_cmd, capture_output=True, text=True, check=False)
+        if process.returncode == 0:
+            logger.info("Rsync berhasil mengambil arsip dinamis ke cache lokal.")
+            # logger.debug(f"Rsync stdout: {process.stdout}")
+            # logger.debug(f"Rsync stderr: {process.stderr}")
+            return True
+        else:
+            logger.error(f"Rsync gagal dengan kode {process.returncode}.")
+            logger.error(f"Rsync stdout: {process.stdout}")
+            logger.error(f"Rsync stderr: {process.stderr}")
+            return False
+    except Exception as e:
+        logger.error(f"Error saat menjalankan rsync: {e}", exc_info=True)
+        return False
+
+def restore_dynamic_files_from_cache(config):
+    """Memulihkan file dinamis dari cache lokal yang sudah di-fetch."""
+    if not config.get("BACKUP_DYNAMIC", "false").lower() == "true":
+        logger.info("Restore file dinamis tidak diaktifkan dalam konfigurasi.")
+        return True # Bukan error, hanya dilewati
+
+    logger.info("Memulai proses restore file dinamis dari cache lokal...")
+    web_dir = config['WEB_DIR']
+    local_cache_dir = config['LOCAL_DYNAMIC_RESTORE_CACHE_DIR']
+    dynamic_dirs_config = config.get('DYNAMIC_DIRS', []) # DYNAMIC_DIRS sudah berupa list dari load_config
+
+    if not isinstance(dynamic_dirs_config, list):
+        logger.error(f"DYNAMIC_DIRS bukan list di konfigurasi: {dynamic_dirs_config}")
+        return False
+
+    if not dynamic_dirs_config:
+        logger.info("Tidak ada DYNAMIC_DIRS yang dikonfigurasi untuk direstore.")
+        return True
+
+    all_restored_successfully = True
+    for dir_name_in_config in dynamic_dirs_config:
+        # Nama arsip di staging adalah dir_name_config_timestamp.tar.gz
+        # dir_name_in_config bisa mengandung slash, misal "wp-content/uploads"
+        # web-backup-dynamic mengganti '/' dengan '_' saat membuat nama arsip
+        archive_base_name = dir_name_in_config.replace('/', '_')
+        
+        archive_pattern = os.path.join(local_cache_dir, f"{archive_base_name}_*.tar.gz")
+        found_archives = glob.glob(archive_pattern)
+
+        if not found_archives:
+            logger.warning(f"Tidak ada arsip backup ditemukan di cache '{local_cache_dir}' untuk '{dir_name_in_config}' (pola: {archive_base_name}_*.tar.gz).")
+            continue
+
+        latest_archive = max(found_archives, key=os.path.getmtime)
+        target_path_for_dir = os.path.join(web_dir, dir_name_in_config)
+
+        logger.info(f"Mencoba merestore '{dir_name_in_config}' dari arsip terbaru: '{latest_archive}' ke '{web_dir}'")
+        
+        try:
+            # Backup direktori/file yang ada sebelum overwrite (opsional tapi aman)
+            if os.path.exists(target_path_for_dir):
+                pre_restore_backup_name = f"{archive_base_name}_prerestore_{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}.bak"
+                pre_restore_backup_path = os.path.join(local_cache_dir, pre_restore_backup_name)
+                logger.info(f"Membackup '{target_path_for_dir}' ke '{pre_restore_backup_path}' sebelum restore.")
+                if os.path.isdir(target_path_for_dir):
+                    shutil.copytree(target_path_for_dir, pre_restore_backup_path, symlinks=True)
+                else: # jika itu file
+                    shutil.copy2(target_path_for_dir, pre_restore_backup_path)
+
+            # Hapus target path yang ada sebelum ekstrak untuk menghindari konflik merge
+            if os.path.lexists(target_path_for_dir): # lexists juga menangani broken symlink
+                logger.info(f"Menghapus '{target_path_for_dir}' yang ada sebelum ekstraksi...")
+                if os.path.isdir(target_path_for_dir) and not os.path.islink(target_path_for_dir):
+                    shutil.rmtree(target_path_for_dir)
+                else:
+                    os.unlink(target_path_for_dir)
+
+            with tarfile.open(latest_archive, "r:gz") as tar:
+                # Ekstrak ke $WEB_DIR. Arsip dibuat dengan -C $WEB_DIR "$dir_name",
+                # jadi path di dalam arsip adalah 'dir_name/...'
+                tar.extractall(path=web_dir) 
+            logger.info(f"Berhasil merestore '{dir_name_in_config}' dari '{latest_archive}'.")
+            
+            # Atur ulang kepemilikan dan izin jika perlu (mungkin perlu info WEB_SERVER_USER/GROUP dari config)
+            web_server_user = config.get('WEB_SERVER_USER')
+            web_server_group = config.get('WEB_SERVER_GROUP')
+            if web_server_user and web_server_group:
+                try:
+                    # subprocess.run(['chown', '-R', f'{web_server_user}:{web_server_group}', target_path_for_dir], check=True)
+                    # shutil.chown tidak rekursif, perlu os.walk atau find + chown
+                    for dirpath, dirnames, filenames in os.walk(target_path_for_dir):
+                        shutil.chown(dirpath, user=web_server_user, group=web_server_group)
+                        for filename in filenames:
+                            shutil.chown(os.path.join(dirpath, filename), user=web_server_user, group=web_server_group)
+                    logger.info(f"Kepemilikan untuk '{target_path_for_dir}' diatur ke {web_server_user}:{web_server_group}")
+                except Exception as e_chown:
+                    logger.warning(f"Gagal mengatur kepemilikan untuk '{target_path_for_dir}': {e_chown}")
+            
+        except Exception as e:
+            logger.error(f"Gagal merestore '{dir_name_in_config}' dari '{latest_archive}': {e}", exc_info=True)
+            all_restored_successfully = False
+            
+    if all_restored_successfully:
+        logger.info("Semua file/direktori dinamis yang dikonfigurasi berhasil direstore dari cache.")
+    else:
+        logger.warning("Beberapa file/direktori dinamis mungkin gagal direstore. Periksa log di atas.")
+        
+    # Bersihkan cache setelah selesai (opsional)
+    # logger.info(f"Membersihkan cache restore dinamis di '{local_cache_dir}'...")
+    # try:
+    #     shutil.rmtree(local_cache_dir)
+    #     os.makedirs(local_cache_dir, exist_ok=True) # Buat lagi untuk pemanggilan berikutnya
+    # except Exception as e:
+    #     logger.warning(f"Gagal membersihkan direktori cache '{local_cache_dir}': {e}")
+
+    return all_restored_successfully
+
+
 def main():
-    """Fungsi utama"""
-    # Banner
-    print("=================================================================")
-    print("      RESTORE SISTEM ANTI-DEFACEMENT WEB SERVER                  ")
-    print("=================================================================")
-    
-    # Parse argumen
     parser = argparse.ArgumentParser(description="Web Server Anti-Defacement Restore Tool")
-    parser.add_argument("--auto", action="store_true", help="Mode otomatis tanpa interaksi")
-    parser.add_argument("--alert", action="store_true", help="Dipanggil dari alert Wazuh")
-    parser.add_argument("--non-root", action="store_true", help="Jalankan dalam mode non-root")
+    parser.add_argument("--auto", action="store_true", help="Mode otomatis tanpa interaksi (misalnya dari Wazuh AR)")
+    parser.add_argument("--alert", action="store_true", help="Dipanggil dari alert Wazuh (implisit --auto)")
+    parser.add_argument("--non-root", action="store_true", help="Jalankan dalam mode non-root (izin harus sudah diatur)")
+    # Tambahkan argumen untuk memilih commit jika ingin mode interaktif lebih lanjut
+    # parser.add_argument("--commit", type=str, help="ID commit spesifik untuk restore (mode manual)")
     args = parser.parse_args()
+
+    is_automated_call = args.auto or args.alert
     
-    # Muat konfigurasi
-    config = load_config()
-    web_dir = config.get('WEB_DIR')
-    
-    if not web_dir:
-        logger.error("Direktori web tidak ditemukan dalam konfigurasi")
+    if is_automated_call:
+        logger.info("Restore_auto.py dipanggil dalam mode otomatis/alert.")
+    else:
+        logger.info("Restore_auto.py dipanggil dalam mode interaktif/manual.")
+        print("=================================================================")
+        print("      RECOVERY SYSTEM - WEB SERVER ANTI-DEFACEMENT               ")
+        print("=================================================================")
+
+    try:
+        config = load_config()
+    except SystemExit: # Sudah di-log oleh load_config
+        sys.exit(1) # Pastikan keluar jika config gagal dimuat
+        
+    web_dir = config['WEB_DIR']
+
+    # Verifikasi password hanya jika BUKAN panggilan otomatis/alert
+    if not is_automated_call:
+        if 'PASSWORD' not in config or not config['PASSWORD']:
+            logger.critical("PASSWORD tidak ditemukan di konfigurasi untuk mode interaktif.")
+            sys.exit(1)
+        verify_password_interactive(config['PASSWORD'])
+
+    # 1. Restore Konten Statis dari Git
+    logger.info(f"Memulai proses restore untuk direktori web: {web_dir}")
+    try:
+        repo = git.Repo(web_dir)
+    except git.exc.InvalidGitRepositoryError:
+        logger.critical(f"Repository Git tidak valid atau tidak ditemukan di {web_dir}.")
+        sys.exit(1)
+    except Exception as e_repo:
+        logger.critical(f"Gagal mengakses repository Git di {web_dir}: {e_repo}", exc_info=True)
+        sys.exit(1)
+
+    selected_commit = get_latest_commit_for_restore(repo)
+    if not selected_commit:
+        logger.error("Gagal mendapatkan commit untuk restore Git. Proses dihentikan.")
+        sys.exit(1)
+
+    git_restore_success = restore_git_content(web_dir, selected_commit)
+    if not git_restore_success:
+        logger.error("Restore konten Git gagal. Proses dihentikan sebagian.")
+        # Pertimbangkan apakah akan melanjutkan ke restore dinamis jika Git gagal
+        # Untuk keamanan, mungkin lebih baik berhenti jika restore inti gagal.
         sys.exit(1)
     
-    # Jalankan restore
-    success = restore_from_backup(web_dir, args.non_root)
-    
-    if success:
-        logger.info("Proses restore selesai dengan sukses")
+    # 2. Restore File Dinamis (jika diaktifkan)
+    dynamic_restore_success = True # Anggap sukses jika tidak diaktifkan
+    if config.get("BACKUP_DYNAMIC", "false").lower() == "true":
+        if fetch_dynamic_archives_from_remote(config):
+            dynamic_restore_success = restore_dynamic_files_from_cache(config)
+        else:
+            logger.error("Gagal mengambil arsip dinamis dari remote. Restore file dinamis dilewati/gagal.")
+            dynamic_restore_success = False # Gagal fetch berarti gagal restore dinamis
+
+    if git_restore_success and dynamic_restore_success:
+        logger.info("Proses restore (Git dan Dinamis jika aktif) selesai dengan sukses.")
+        if not is_automated_call: print("\n[SUCCESS] Proses restore selesai.")
         sys.exit(0)
     else:
-        logger.error("Proses restore gagal")
+        logger.error("Satu atau lebih bagian dari proses restore gagal. Periksa log untuk detail.")
+        if not is_automated_call: print("\n[ERROR] Proses restore gagal. Periksa log.")
         sys.exit(1)
 
 if __name__ == "__main__":
-    main() 
+    # Cek apakah dijalankan sebagai root jika --non-root tidak diset
+    # Argumen --non-root ada untuk kasus di mana Wazuh AR dikonfigurasi untuk menjalankan skrip sebagai user wazuh
+    # dengan sudo terkonfigurasi, atau jika izin sudah diatur sedemikian rupa.
+    # Namun, operasi seperti git reset --hard dan git clean -fd biasanya memerlukan hak tulis penuh di WEB_DIR.
+    # Rsync ke direktori sistem juga mungkin memerlukan root.
+    # Untuk kesederhanaan, kita tidak menambahkan cek root di sini, asumsikan dijalankan dengan hak yang sesuai.
+    main()
