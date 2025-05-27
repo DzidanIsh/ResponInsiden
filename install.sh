@@ -134,7 +134,7 @@ CLAMD_SOCKET=${CLAMD_SOCKET:-/var/run/clamav/clamd.ctl}
 # Konfigurasi Containment (Rule ID untuk pemicu)
 info_msg "Konfigurasi Containment (Rule ID Wazuh Pemicu)..."
 read -r -p "Masukkan Rule ID Wazuh untuk Defacement (pisahkan dengan koma, contoh: 550,554): " DEFACE_RULE_IDS
-DEFACE_RULE_IDS=${DEFACE_RULE_IDS:-"550,554,5501,5502,5503,5504,100001,100002"}
+DEFACE_RULE_IDS=${DEFACE_RULE_IDS:-"500550"}
 
 read -r -p "Masukkan Rule ID Wazuh untuk Serangan Lain (pisahkan dengan koma): " ATTACK_RULE_IDS
 ATTACK_RULE_IDS=${ATTACK_RULE_IDS:-"5710,5712,5715,5760,100003,100004"}
@@ -203,7 +203,24 @@ SSH_IDENTITY_FILE_PATH=""
 # 3. Membuat File Konfigurasi /etc/web-backup/config.conf
 # --------------------------------------------------------
 info_msg "Membuat file konfigurasi $CONFIG_DIR/config.conf..."
-DEFAULT_ERADICATION_PATTERNS='(?i)(eval\s*\(base64_decode\s*\()|||(?i)(passthru\s*\()|||(?i)(shell_exec\s*\()|||(?i)(system\s*\()|||(?i)(exec\s*\()|||(?i)(preg_replace\s*\(.*\/e\s*\))|||(?i)(FilesMan|phpfm|P\.A\.S\.|\bWebShell\b|r57shell|c99shell)|||(?i)(document\.write\s*\(\s*unescape\s*\()|||(?i)(<iframe\s*src\s*=\s*["\']javascript:)|||(?i)(fsockopen|pfsockopen)\s*\('
+# Inisialisasi variabel
+DEFAULT_ERADICATION_PATTERNS=''
+# Tambahkan setiap pola secara bertahap
+DEFAULT_ERADICATION_PATTERNS+='(?i)(eval\s*\(base64_decode\s*\()|||'
+DEFAULT_ERADICATION_PATTERNS+='(?i)(passthru\s*\()|||'
+DEFAULT_ERADICATION_PATTERNS+='(?i)(shell_exec\s*\()|||'
+DEFAULT_ERADICATION_PATTERNS+='(?i)(system\s*\()|||'
+DEFAULT_ERADICATION_PATTERNS+='(?i)(exec\s*\()|||'
+# Perhatikan bagian ini, ini adalah salah satu bagian yang kompleks
+DEFAULT_ERADICATION_PATTERNS+='(?i)(preg_replace\s*\(.*\/e\s*\))|||'
+DEFAULT_ERADICATION_PATTERNS+='(?i)(FilesMan|phpfm|P\.A\.S\.|\bWebShell\b|r57shell|c99shell)|||'
+DEFAULT_ERADICATION_PATTERNS+='(?i)(document\.write\s*\(\s*unescape\s*\()|||'
+DEFAULT_ERADICATION_PATTERNS+='(?i)(fsockopen|pfsockopen)\s*\('
+
+# Sekarang Anda bisa menggunakan variabel DEFAULT_ERADICATION_PATTERNS
+# Contoh:
+# echo "$DEFAULT_ERADICATION_PATTERNS"
+
 
 # Variabel SSH_IDENTITY_FILE_PATH akan diisi nanti di bagian 10
 # dan kemudian ditambahkan ke file config.conf saat file tersebut ditulis ulang atau diperbarui
