@@ -303,12 +303,12 @@ cd "$TEMP_DIR" || error_exit "Gagal masuk ke direktori temporer."
 REPO_URL_BASE="https://raw.githubusercontent.com/DzidanIsh/ResponInsiden/main" # Ganti dengan URL Repo Anda
 
 FILES_TO_DOWNLOAD=(
-    "Backup/backup.sh /usr/local/bin web-backup root root"                 # Akan dimodifikasi di repo Anda
-    "Backup/restore.py /usr/local/bin web-restore root root"             # Akan dimodifikasi di repo Anda (atau restore_auto.py)
-    "Backup/restore_auto.py /usr/local/bin restore_auto.py root root"     # Akan dimodifikasi di repo Anda
-    "Backup/containment.py /usr/local/bin containment.py root root"       # Akan dimodifikasi di repo Anda
-    "Backup/eradication.py /usr/local/bin eradication.py root root"       # Akan dimodifikasi di repo Anda
-    "Backup/maintenance.html $WEB_DIR maintenance.html $WEB_SERVER_USER $WEB_SERVER_GROUP"
+    "backup.sh /usr/local/bin web-backup root root"                 # Akan dimodifikasi di repo Anda
+    "restore.py /usr/local/bin web-restore root root"             # Akan dimodifikasi di repo Anda (atau restore_auto.py)
+    "restore_auto.py /usr/local/bin restore_auto.py root root"     # Akan dimodifikasi di repo Anda
+    "containment.py /usr/local/bin containment.py root root"       # Akan dimodifikasi di repo Anda
+    "eradication.py /usr/local/bin eradication.py root root"       # Akan dimodifikasi di repo Anda
+    "maintenance.html $WEB_DIR maintenance.html $WEB_SERVER_USER $WEB_SERVER_GROUP"
 )
 
 download_from_github() {
