@@ -49,6 +49,7 @@ class Colors:
     FAIL = '\033[91m'
     ENDC = '\033[0m'
     BOLD = '\033[1m'
+    YELLOW = '\033[33m'
 
 CONFIG_FILE = "/etc/web-backup/config.conf"
 
