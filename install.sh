@@ -46,7 +46,7 @@ fi
 info_msg "Melakukan update daftar paket (apt-get update)..."
 apt-get update -y || warning_msg "Gagal melakukan apt-get update, proses instalasi dilanjutkan."
 
-REQUIRED_CMDS=("git" "python3" "curl" "pip3" "rsync") # Menambahkan rsync
+REQUIRED_CMDS=("git" "python3" "curl" "pip3" "rsync" "dos2unix") # Menambahkan rsync
 for cmd in "${REQUIRED_CMDS[@]}"; do
     if ! command -v "$cmd" &> /dev/null; then
         info_msg "$cmd tidak ditemukan. Mencoba menginstal..."
@@ -250,16 +250,20 @@ done
 
 PYTHON_LIBRARIES=("requests" "GitPython" "paramiko" "python-clamd" "yara-python")
 if ! dpkg -s "python3-magic" &> /dev/null && ! pip3 list --format=freeze | grep -qi "python-magic"; then
-    PYTHON_LIBRARIES+=("python-magic")
+    PYTHON_LIBRARIES+=("python-magic") # Pastikan python-magic terinstal jika python3-magic tidak ada
 fi
 
 info_msg "Menginstal library Python via pip3: ${PYTHON_LIBRARIES[*]}..."
-pip3 install --upgrade pip
+pip3 install --upgrade pip # Upgrade pip itu sendiri
 # shellcheck disable=SC2068
-if pip3 install ${PYTHON_LIBRARIES[@]}; then
+# Jika install.sh dijalankan sebagai root, pip3 install akan berjalan sebagai root.
+if pip3 install "${PYTHON_LIBRARIES[@]}"; then
     success_msg "Library Python berhasil diinstal."
 else
     warning_msg "Gagal menginstal satu atau lebih library Python. Beberapa fungsionalitas mungkin terganggu."
+    # Anda bisa menambahkan detail error di sini jika mau, misalnya:
+    # pip3 install "${PYTHON_LIBRARIES[@]}" --log /tmp/pip_install.log
+    # warning_msg "Lihat /tmp/pip_install.log untuk detail kegagalan pip."
 fi
 
 if command -v freshclam &> /dev/null; then
@@ -329,6 +333,23 @@ download_from_github() {
         else
             warning_msg "Pengguna '$owner' atau grup '$group' tidak valid. Kepemilikan $target_dir/$target_filename tidak diubah."
         fi
+
+        # --- AWAL BLOK TAMBAHAN UNTUK KONVERSI AKHIRAN BARIS ---
+        # Cek apakah file sumber adalah file Python berdasarkan ekstensinya
+        if [[ "$file_path_in_repo" == *.py ]]; then
+            if command -v dos2unix &> /dev/null; then
+                info_msg "Mengonversi akhiran baris untuk skrip Python: $target_dir/$target_filename (sumber: $file_path_in_repo)..."
+                if dos2unix "$target_dir/$target_filename"; then
+                    success_msg "Akhiran baris untuk $target_dir/$target_filename berhasil dikonversi ke format Unix."
+                else
+                    warning_msg "Gagal mengonversi akhiran baris untuk $target_dir/$target_filename."
+                fi
+            else
+                warning_msg "Perintah dos2unix tidak ditemukan. Lewati konversi akhiran baris untuk $target_dir/$target_filename."
+                warning_msg "Harap instal dos2unix secara manual dan konversi file ini: $target_dir/$target_filename"
+            fi
+        fi
+        # --- AKHIR BLOK TAMBAHAN ---
     else
         error_exit "Gagal mengunduh $file_path_in_repo dari GitHub. Pastikan URL REPO_URL_BASE dan path file benar."
     fi
@@ -753,6 +774,19 @@ echo ""
 
 # --- MENULIS FILE KONFIGURASI config.conf SEKARANG ---
 info_msg "Menulis/Memperbarui file konfigurasi $CONFIG_DIR/config.conf dengan semua nilai..."
+
+# Definisikan array DYNAMIC_DIRS di install.sh (sebelum heredoc)
+# Anda bisa membiarkan ini sebagai array default atau meminta input pengguna untuk mengisinya.
+# Untuk contoh ini, kita gunakan array default dari skrip asli Anda.
+CONFIG_DYNAMIC_DIRS_ARRAY=(
+    "logs" "cache" "tmp" "temp" "uploads" "media" "sessions" "wp-content/uploads" "wp-content/cache"
+)
+# Ubah array menjadi string satu baris yang diformat untuk config.conf
+# Formatnya adalah: ("item1" "item2" "item3")
+# Setiap item diapit kutip ganda dan dipisahkan spasi, seluruhnya diapit tanda kurung.
+CONFIG_DYNAMIC_DIRS_STRING="($(printf "\"%s\" " "${CONFIG_DYNAMIC_DIRS_ARRAY[@]}" | sed 's/ $//'))"
+
+
 cat > "$CONFIG_DIR/config.conf" << EOF
 # Konfigurasi Umum
 WEB_DIR="$WEB_DIR"
@@ -771,15 +805,13 @@ BACKUP_DYNAMIC="$BACKUP_DYNAMIC"
 LOCAL_DYNAMIC_STAGING_DIR="$LOCAL_DYNAMIC_STAGING_DIR"
 REMOTE_DYNAMIC_BACKUP_PATH="$REMOTE_DYNAMIC_BACKUP_PATH"
 LOCAL_DYNAMIC_RESTORE_CACHE_DIR="$LOCAL_DYNAMIC_RESTORE_CACHE_DIR"
-DYNAMIC_DIRS=(
-    "logs" "cache" "tmp" "temp" "uploads" "media" "sessions" "wp-content/uploads" "wp-content/cache"
-) # Sesuaikan DYNAMIC_DIRS dengan kebutuhan Anda
+DYNAMIC_DIRS=$CONFIG_DYNAMIC_DIRS_STRING # DIUBAH: Gunakan string yang sudah diformat
 
 # Konfigurasi Eradication
 QUARANTINE_DIR="$QUARANTINE_DIR"
 YARA_RULES_DIR="$YARA_RULES_DIR"
 CLAMD_SOCKET="$CLAMD_SOCKET"
-ERADICATION_SUSPICIOUS_PATTERNS="$DEFAULT_ERADICATION_PATTERNS"
+ERADICATION_SUSPICIOUS_PATTERNS='$DEFAULT_ERADICATION_PATTERNS' # DIUBAH: Pastikan ini di-quote dengan benar agar $ tidak diekspansi oleh heredoc jika tidak diinginkan
 
 # Konfigurasi Containment
 DEFACE_RULE_IDS="$DEFACE_RULE_IDS"
