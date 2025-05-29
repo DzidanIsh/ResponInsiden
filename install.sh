@@ -230,6 +230,19 @@ DEFAULT_ERADICATION_PATTERNS+='(?i)(fsockopen|pfsockopen)\s*\('
 
 # 4. Instalasi Dependensi Sistem dan Python
 # -----------------------------------------
+# Fungsi helper untuk menampilkan pesan (asumsikan sudah ada atau definisikan)
+info_msg() {
+    echo "[INFO] $1"
+}
+
+success_msg() {
+    echo "[SUCCESS] $1"
+}
+
+warning_msg() {
+    echo "[WARNING] $1"
+}
+
 info_msg "Memulai instalasi dependensi sistem dan Python..."
 
 SYSTEM_PACKAGES=("clamav-daemon" "clamav-freshclam" "yara")
@@ -242,29 +255,81 @@ fi
 for pkg in "${SYSTEM_PACKAGES[@]}"; do
     if ! dpkg -s "$pkg" &> /dev/null; then
         info_msg "Menginstal $pkg..."
-        apt-get install -y "$pkg" || warning_msg "Gagal menginstal $pkg. Beberapa fungsionalitas mungkin terganggu."
+        if sudo apt-get install -y "$pkg"; then
+            success_msg "$pkg berhasil diinstal."
+        else
+            warning_msg "Gagal menginstal $pkg. Beberapa fungsionalitas mungkin terganggu."
+        fi
     else
         info_msg "$pkg sudah terinstal."
     fi
 done
 
-PYTHON_LIBRARIES=("requests" "GitPython" "paramiko" "python-clamd" "yara-python")
+# Definisikan pustaka Python inti dan lainnya
+PYTHON_LIBRARIES_CORE=("GitPython" "paramiko")
+PYTHON_LIBRARIES_OTHERS=("requests" "python-clamd" "yara-python")
+
+# Logika untuk python-magic: tambahkan ke daftar inti jika diperlukan
 if ! dpkg -s "python3-magic" &> /dev/null && ! pip3 list --format=freeze | grep -qi "python-magic"; then
-    PYTHON_LIBRARIES+=("python-magic") # Pastikan python-magic terinstal jika python3-magic tidak ada
+    info_msg "python3-magic (paket sistem) tidak ditemukan dan python-magic (pip) tidak terinstal. Menambahkan python-magic ke daftar instalasi pip."
+    PYTHON_LIBRARIES_CORE+=("python-magic")
 fi
 
-info_msg "Menginstal library Python via pip3: ${PYTHON_LIBRARIES[*]}..."
-pip3 install --upgrade pip # Upgrade pip itu sendiri
-# shellcheck disable=SC2068
-# Jika install.sh dijalankan sebagai root, pip3 install akan berjalan sebagai root.
-if pip3 install "${PYTHON_LIBRARIES[@]}"; then
-    success_msg "Library Python berhasil diinstal."
+# Gabungkan semua pustaka untuk pesan info awal (opsional, untuk konsistensi)
+ALL_PYTHON_LIBS_FOR_INFO=("${PYTHON_LIBRARIES_CORE[@]}" "${PYTHON_LIBRARIES_OTHERS[@]}")
+# Hilangkan duplikat jika python-magic sudah ada di others (meskipun dalam kasus ini tidak)
+ALL_PYTHON_LIBS_FOR_INFO=($(printf "%s\n" "${ALL_PYTHON_LIBS_FOR_INFO[@]}" | sort -u))
+
+
+info_msg "Akan menginstal library Python via pip3: ${ALL_PYTHON_LIBS_FOR_INFO[*]}..."
+
+info_msg "Mengupgrade pip..."
+if sudo pip3 install --upgrade pip; then
+    success_msg "pip berhasil diupgrade."
 else
-    warning_msg "Gagal menginstal satu atau lebih library Python. Beberapa fungsionalitas mungkin terganggu."
-    # Anda bisa menambahkan detail error di sini jika mau, misalnya:
-    # pip3 install "${PYTHON_LIBRARIES[@]}" --log /tmp/pip_install.log
-    # warning_msg "Lihat /tmp/pip_install.log untuk detail kegagalan pip."
+    warning_msg "Gagal mengupgrade pip. Melanjutkan dengan versi pip saat ini."
 fi
+
+OVERALL_PYTHON_INSTALL_SUCCESS=true
+
+# Instal pustaka inti
+if [ ${#PYTHON_LIBRARIES_CORE[@]} -gt 0 ]; then
+    info_msg "Menginstal library Python inti: ${PYTHON_LIBRARIES_CORE[*]}..."
+    # shellcheck disable=SC2068
+    if sudo pip3 install ${PYTHON_LIBRARIES_CORE[@]}; then
+        success_msg "Library Python inti (${PYTHON_LIBRARIES_CORE[*]}) berhasil diinstal."
+    else
+        warning_msg "Gagal menginstal satu atau lebih library Python inti (${PYTHON_LIBRARIES_CORE[*]})."
+        # Tambahkan detail error jika mau
+        # sudo pip3 install ${PYTHON_LIBRARIES_CORE[@]} --log /tmp/pip_core_install.log
+        # warning_msg "Lihat /tmp/pip_core_install.log untuk detail kegagalan pip inti."
+        OVERALL_PYTHON_INSTALL_SUCCESS=false
+    fi
+else
+    info_msg "Tidak ada library Python inti yang perlu diinstal secara spesifik saat ini."
+fi
+
+# Instal pustaka lainnya
+if [ ${#PYTHON_LIBRARIES_OTHERS[@]} -gt 0 ]; then
+    info_msg "Menginstal library Python tambahan: ${PYTHON_LIBRARIES_OTHERS[*]}..."
+    # shellcheck disable=SC2068
+    if sudo pip3 install ${PYTHON_LIBRARIES_OTHERS[@]}; then
+        success_msg "Library Python tambahan (${PYTHON_LIBRARIES_OTHERS[*]}) berhasil diinstal."
+    else
+        warning_msg "Gagal menginstal satu atau lebih library Python tambahan (${PYTHON_LIBRARIES_OTHERS[*]})."
+        OVERALL_PYTHON_INSTALL_SUCCESS=false
+    fi
+else
+    info_msg "Tidak ada library Python tambahan yang perlu diinstal."
+fi
+
+
+if $OVERALL_PYTHON_INSTALL_SUCCESS; then
+    success_msg "Semua library Python yang dijadwalkan telah berhasil diproses."
+else
+    warning_msg "Satu atau lebih library Python mungkin gagal diinstal. Periksa log di atas. Beberapa fungsionalitas mungkin terganggu."
+fi
+
 
 if command -v freshclam &> /dev/null; then
     info_msg "Menjalankan freshclam untuk memperbarui database ClamAV (mungkin perlu beberapa saat)..."
