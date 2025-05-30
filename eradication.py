@@ -23,10 +23,10 @@ except ImportError:
     logging.warning("Library 'yara-python' tidak terinstal. Scan YARA akan dinonaktifkan.")
 
 try:
-    import clamd
+    import pyclamd
 except ImportError:
-    clamd = None
-    logging.warning("Library 'python-clamd' tidak terinstal. Scan ClamAV akan dinonaktifkan.")
+    pyclamd = None
+    logging.warning("Library 'pyclamd' tidak terinstal. Scan ClamAV akan dinonaktifkan.")
 
 try:
     import requests
@@ -122,19 +122,20 @@ class EradicationManager:
     # --- Fungsi-fungsi pengecekan (ClamAV, YARA), setup karantina, hash ---
     # (salin dari versi sebelumnya: _check_clamav_availability, _check_yara_availability,
     #  setup_quarantine_dir, calculate_file_hash)
+
     def _check_clamav_availability(self):
-        if clamd is None: return False
-        if not os.path.exists(self.clamd_socket_path):
-            logger.warning(f"Socket ClamAV '{self.clamd_socket_path}' tidak ditemukan. Scan ClamAV dinonaktifkan.")
+        if pyclamd is None:
             return False
         try:
-            cd = clamd.ClamdUnixSocket(self.clamd_socket_path)
+            cd = pyclamd.ClamdUnixSocket(path=self.clamd_socket_path)
             cd.ping()
-            logger.info(f"Koneksi ke ClamAV di '{self.clamd_socket_path}' berhasil. Scan ClamAV diaktifkan.")
+            self.clamd_client = cd
+            logger.info("Koneksi ke ClamAV berhasil via pyclamd.")
             return True
         except Exception as e:
-            logger.warning(f"Gagal terhubung/menginisialisasi ClamAV: {e}. Scan ClamAV dinonaktifkan.")
+            logger.warning(f"Gagal menghubungi ClamAV daemon: {e}")
             return False
+
 
     def _check_yara_availability(self):
         if yara is None: return False
@@ -278,24 +279,19 @@ class EradicationManager:
     # --- Fungsi-fungsi scan (scan_with_clamav, scan_with_yara, check_suspicious_content) ---
     # (salin dari versi sebelumnya, tapi pastikan mereka me-return detail yang cukup untuk enrichment)
     def scan_with_clamav(self, file_path):
-        if not self.clamav_enabled: return None
+        if not self.clamav_enabled or not hasattr(self, 'clamd_client'):
+            return None
         try:
-            logger.debug(f"Memindai file '{file_path}' dengan ClamAV...")
-            cd = clamd.ClamdUnixSocket(self.clamd_socket_path)
-            scan_result = cd.scan(file_path)
-            if scan_result and file_path in scan_result:
-                status, virus_name = scan_result[file_path]
+            logger.debug(f"Memindai file '{file_path}' dengan ClamAV (pyclamd)...")
+            result = self.clamd_client.scan_file(file_path)
+            if result:
+                status, virus_name = list(result.values())[0]
                 if status == 'FOUND':
                     logger.warning(f"ClamAV FOUND threat: '{virus_name}' di file '{file_path}'")
                     return {'status': 'FOUND', 'details': virus_name}
-                return {'status': 'OK', 'details': None}
-            return None
-        except clamd.ClamdError as e:
-            logger.error(f"Error ClamAV saat memindai '{file_path}': {e}")
-            if "refused" in str(e).lower() or "socket error" in str(e).lower() : self.clamav_enabled = False
-            return None
+            return {'status': 'OK', 'details': None}
         except Exception as e:
-            logger.error(f"Error umum saat memindai '{file_path}' dengan ClamAV: {e}", exc_info=True)
+            logger.error(f"Error saat scan ClamAV via pyclamd: {e}")
             return None
 
     def scan_with_yara(self, file_path):
