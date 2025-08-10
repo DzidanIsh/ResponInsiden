@@ -133,8 +133,8 @@ CLAMD_SOCKET=${CLAMD_SOCKET:-/var/run/clamav/clamd.ctl}
 
 # Konfigurasi Containment (Rule ID untuk pemicu)
 info_msg "Konfigurasi Containment (Rule ID Wazuh Pemicu)..."
-read -r -p "Masukkan Rule ID Wazuh untuk Defacement (pisahkan dengan koma, contoh: 550,554): " DEFACE_RULE_IDS
-DEFACE_RULE_IDS=${DEFACE_RULE_IDS:-"500550"}
+read -r -p "Masukkan Rule ID Wazuh untuk Defacement (pisahkan dengan koma, contoh: 500550,500554): " DEFACE_RULE_IDS
+DEFACE_RULE_IDS=${DEFACE_RULE_IDS:-"500550,500554"}
 
 read -r -p "Masukkan Rule ID Wazuh untuk Serangan Lain (pisahkan dengan koma): " ATTACK_RULE_IDS
 ATTACK_RULE_IDS=${ATTACK_RULE_IDS:-"5710,5712,5715,5760,100003,100004"}
